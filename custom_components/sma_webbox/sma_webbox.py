@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import socket
 import time
 from asyncio import DatagramTransport, DatagramProtocol, Future
 from asyncio.events import AbstractEventLoop
@@ -73,9 +74,52 @@ def update_channel_values(
             current_channel_values[key] = channel_value
 
 
-# - UDP client class ------------------------------------------------------------
+# - Synchronous UDP RPC (Compatibility Fix for Python 3.14+) -----------------
+def sync_rpc_request(addr: Tuple[str, int], payload: str) -> dict:
+    """Send a synchronous UDP RPC request to the SMA Webbox.
+
+    The SMA Webbox requires responses to be sent back to WEBBOX_PORT (34268).
+    This function uses raw sockets with SO_REUSEADDR/PORT to ensure the port
+    is available, bypassing asyncio DatagramProtocol limitations in 3.14.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except AttributeError:
+        pass  # Not available on all platforms (e.g. Windows)
+
+    sock.settimeout(WEBBOX_TIMEOUT)
+    try:
+        sock.bind(("0.0.0.0", WEBBOX_PORT))
+        sock.sendto(payload.encode(), addr)
+        deadline = time.monotonic() + WEBBOX_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SmaWebboxTimeoutException("RPC request timed out") from None
+            sock.settimeout(remaining)
+            data, src_addr = sock.recvfrom(65535)
+            # Ensure we only process data from the expected Webbox IP
+            if src_addr[0] == addr[0]:
+                return json.loads(data.decode('iso-8859-1').replace("\0", ""))
+    except SmaWebboxTimeoutException:
+        raise
+    except TimeoutError:
+        raise SmaWebboxTimeoutException("RPC request timed out") from None
+    except OSError as ex:
+        raise SmaWebboxTimeoutException(f"RPC socket error: {ex}") from ex
+    finally:
+        sock.close()
+
+
+# - UDP client class ----------------------------------------------------------
 class WebboxClientProtocol:
-    """Webbox multi-client UDP protocol implementation"""
+    """Webbox multi-client UDP protocol implementation.
+    
+    Stub retained for API compatibility with existing integration layers.
+    RPC communication is now offloaded to sync_rpc_request via an executor.
+    """
 
     def __init__(self, on_connected: Future) -> None:
         """Instance parameter initialisation."""
@@ -94,25 +138,12 @@ class WebboxClientProtocol:
             self._transport.close()
 
     def request(self, request: str, remote_addr: Tuple[str, int], reply: Future) -> None:
-        """Send request message to remote address"""
-        if remote_addr[0] in self._outstanding_requests:
-            _LOGGER.warning("Outstanding request exists for %s (removed)", remote_addr[0])
-        if self._transport:
-            if not self._transport.is_closing():
-                self._outstanding_requests[remote_addr[0]] = reply
-                self._transport.sendto(request.encode(), remote_addr)
-        else:
-            _LOGGER.warning(
-                "Request for %s ignored (missing transport layer)",
-                self._outstanding_requests[remote_addr[0]]
-            )
+        """Deprecated: Logic moved to sync_rpc_request."""
+        pass
 
     def request_cancel(self, remote_addr: Tuple[str, int]) -> None:
-        """Cancel outstanding request to remote address"""
-        if remote_addr[0] in self._outstanding_requests:
-            if not self._outstanding_requests[remote_addr[0]].cancelled():
-                self._outstanding_requests[remote_addr[0]].cancel()
-            del self._outstanding_requests[remote_addr[0]]
+        """Deprecated: Logic moved to sync_rpc_request."""
+        pass
 
     # - Base and Datagram protocols methods -----------------------------------
     def connection_made(self, transport: DatagramTransport) -> None:
@@ -122,22 +153,16 @@ class WebboxClientProtocol:
         self._on_connected.set_result(True)
 
     def datagram_received(self, data: bytes, remote_addr: Tuple[str, int]) -> None:
-        """Return Webbox response to rpc caller by releasing corresponding future."""
-        if remote_addr[0] in self._outstanding_requests:
-            data = json.loads(data.decode('iso-8859-1').replace("\0", ""))
-            if not self._outstanding_requests[remote_addr[0]].cancelled():
-                self._outstanding_requests[remote_addr[0]].set_result(data)
-            del self._outstanding_requests[remote_addr[0]]
+        """Deprecated: Logic moved to sync_rpc_request."""
+        pass
 
     def error_received(self, exc: Exception) -> None:
         """Close connection upon unexpected errors."""
         _LOGGER.warning("Closing connection (Error received: %s)", exc)
         self.close()
 
-    def connection_lost(
-        self, exc: Exception
-    ) -> None:  # pylint: disable=unused-argument
-        """Destroy _onconnected future to reset is_connected."""
+    def connection_lost(self, exc: Exception) -> None:  # pylint: disable=unused-argument
+        """Destroy _outstanding_requests future to reset is_connected."""
         _LOGGER.info("WebboxClientProtocol closed (%s)", exc)
         self._outstanding_requests = {}
 
@@ -207,9 +232,7 @@ class WebboxClientInstance:  # pylint: disable=too-many-instance-attributes
             )
         )
 
-    async def get_process_data(
-        self, key: str, channels: Tuple[str, ...]
-    ) -> dict:
+    async def get_process_data(self, key: str, channels: Tuple[str, ...]) -> dict:
         """Define wrapper for get_process_data procedure."""
         devices = [{WEBBOX_REP_DEVICE_KEY: key, WEBBOX_REP_CHANNELS: channels}]
         return await self._rpc(
@@ -241,9 +264,7 @@ class WebboxClientInstance:  # pylint: disable=too-many-instance-attributes
         """Send RPC request and wait for/return response."""
         # Wait for a minimum time between two rpc requests
         await asyncio.sleep(
-            max(
-                0, WEBBOX_RPC_INTERVAL - (time.time() - self._last_access_time)
-            )
+            max(0, WEBBOX_RPC_INTERVAL - (time.time() - self._last_access_time))
         )
         self._last_access_time = time.time()
 
@@ -251,19 +272,18 @@ class WebboxClientInstance:  # pylint: disable=too-many-instance-attributes
 
         # Send RPC/UDP request to SMA Webbox
         _LOGGER.debug("%s:%d request %s", *self._addr, payload)
-        on_received = self._loop.create_future()
-        self._api.request(payload, self._addr, on_received)
-
+        
         # Wait for response from SMA Webbox
         try:
-            response = await asyncio.wait_for(
-                on_received, timeout=WEBBOX_TIMEOUT
+            # Rationale: Offload blocking socket I/O to a thread executor to avoid
+            # blocking the loop and to bypass Python 3.14+ UDP port binding issues.
+            response = await self._loop.run_in_executor(
+                None, sync_rpc_request, self._addr, payload
             )
             _LOGGER.debug("%s:%d reply: %s", *self._addr, response)
-        except asyncio.TimeoutError:
+        except SmaWebboxTimeoutException:
             _LOGGER.warning("RPC request to %s timed out", self._addr[0])
-            self._api.request_cancel(self._addr)
-            raise SmaWebboxTimeoutException("RPC request timed out") from None
+            raise
 
         # Raise exception upon errored response or id mismatch
         if WEBBOX_REP_ERROR in response:
@@ -273,8 +293,7 @@ class WebboxClientInstance:  # pylint: disable=too-many-instance-attributes
 
         if int(response[WEBBOX_REQ_ID]) != request_id:
             error_msg = (
-                f"Unexpected id (expected {request_id}"
-                f"got {response[WEBBOX_REQ_ID]})"
+                f"Unexpected id (expected {request_id} got {response[WEBBOX_REQ_ID]})"
             )
             _LOGGER.warning(error_msg)
             raise SmaWebboxBadResponseException(error_msg)
@@ -282,59 +301,25 @@ class WebboxClientInstance:  # pylint: disable=too-many-instance-attributes
         return response[WEBBOX_REP_RESULT]
 
     # - Webbox data model -----------------------------------------------------
-    # self._data_cache = {
-    #   'overview': {
-    #     <sensor id> : {                * 'meta'
-    #       'name': <sensor name>,
-    #       'value': <sensor value>,
-    #       'unit': <value unit>,
-    #     }
-    #     ...
-    #   }
-    #   'totalDevicesReturned': <# of devices>
-    #   'devices': [
-    #     { 'key': <key>,
-    #       'name': <name>',
-    #       'channels': <channel list>',
-    #       'channel_values': {
-    #         <sensor id> : {
-    #           'name': <sensor name>,
-    #           'value': <sensor value>,
-    #           'unit': <value unit>,
-    #         },
-    #         ...
-    #       }
-    #       'children': <device list> },
-    #     ...
-    #   ]
-    # }
-
     async def add_device_channels(self, devices: Tuple[dict]) -> None:
         """Add channel properties for each device."""
         for device in devices:
             response = await self.get_process_data_channels(
                 device[WEBBOX_REP_DEVICE_KEY]
             )
-            device[WEBBOX_REP_CHANNELS] = response[
-                device[WEBBOX_REP_DEVICE_KEY]
-            ]
+            device[WEBBOX_REP_CHANNELS] = response[device[WEBBOX_REP_DEVICE_KEY]]
             device[WEBBOX_CHANNEL_VALUES] = {}
-            # TODO: test using fake webbox model ?  pylint: disable=fixme
             if WEBBOX_REP_CHILDREN in device:
                 await self.add_device_channels(device[WEBBOX_REP_CHILDREN])
 
     async def create_webbox_model(self) -> None:
-        """Create SMA Webox data model."""
+        """Create SMA Webbox data model."""
         try:
             self._data_cache[WEBBOX_REP_OVERVIEW] = {}
-            # Fetch device tree
             response = await self.get_devices()
-            # Add channel info to response[WEBBOX_REP_DEVICES] key
             await self.add_device_channels(response[WEBBOX_REP_DEVICES])
-            # Add device data to model
             self._data_cache = {**self._data_cache, **response}
         except Exception as ex:
-            # Error while building webbox model
             raise SmaWebboxConnectionException(
                 f"Unable to create SMA Webbox model from device at "
                 f"{self._addr[0]}:{self._addr[1]} ({ex})"
@@ -343,7 +328,6 @@ class WebboxClientInstance:  # pylint: disable=too-many-instance-attributes
     async def fetch_device_data(self, devices: Tuple[dict]) -> None:
         """Update data for each device."""
         for device in devices:
-            # Fetch data for all sensors of a device
             response = await self.get_process_data(
                 device[WEBBOX_REP_DEVICE_KEY], device[WEBBOX_REP_CHANNELS]
             )
@@ -351,27 +335,20 @@ class WebboxClientInstance:  # pylint: disable=too-many-instance-attributes
                 device[WEBBOX_CHANNEL_VALUES],
                 response[WEBBOX_REP_DEVICES][0][WEBBOX_REP_CHANNELS],
             )
-
-            # TODO: test using fake webbox model ?  pylint: disable=fixme
             if WEBBOX_REP_CHILDREN in device:
                 await self.fetch_device_data(device[WEBBOX_REP_CHILDREN])
 
     async def fetch_webbox_data(self) -> None:
         """Update SMA Webbox data."""
-        # Fetch plant sensor data
         response = await self.get_plant_overview()
         update_channel_values(
             self._data_cache[WEBBOX_REP_OVERVIEW], response[WEBBOX_REP_OVERVIEW]
         )
-        # Fetch all sensor data for all devices
         await self.fetch_device_data(self._data_cache[WEBBOX_REP_DEVICES])
 
 
 # - Main section --------------------------------------------------------------
-
-
 if __name__ == "__main__":
-    # SMA Webbox example code.
     import argparse
     import sys
 
@@ -400,7 +377,6 @@ if __name__ == "__main__":
         )
         for key, items in data[WEBBOX_REP_OVERVIEW].items():
             print_row(key, items)
-
         for device in data[WEBBOX_REP_DEVICES]:
             _LOGGER.info("Devices")
             _LOGGER.info(
@@ -414,57 +390,33 @@ if __name__ == "__main__":
     async def main(url: str) -> None:
         """Connect to webbox and display sensor values forever."""
         _LOGGER.info("Starting SMA Webbox component")
-
         loop = asyncio.get_running_loop()
         on_connected = loop.create_future()
+        on_connected.set_result(True)
+        api = WebboxClientProtocol(on_connected)
 
+        instance = WebboxClientInstance(loop, api, (url, WEBBOX_PORT))
         try:
-            # Create an UDP socket listening on port WEBBOX_PORT
-            # and from any interface
-            _, api = await loop.create_datagram_endpoint(
-                lambda: WebboxClientProtocol(on_connected),
-                local_addr=("0.0.0.0", WEBBOX_PORT),
-                reuse_port=True,
-            )
-
-            # Wait for socket ready signal
-            await on_connected
-
-            instance = WebboxClientInstance(loop, api, (url, WEBBOX_PORT))
-            # Build webbox model (fetch device tree)
             await instance.create_webbox_model()
-
-            # Loop until connection lost or user
-            while api.is_connected:
+            while True:
                 try:
                     await instance.fetch_webbox_data()
                 except SmaWebboxTimeoutException as ex:
                     _LOGGER.warning(ex)
                 except SmaWebboxBadResponseException as ex:
                     _LOGGER.warning(ex)
-
                 print_webbox_info(instance.data)
-
                 await asyncio.sleep(30)
         except SmaWebboxConnectionException as ex:
             _LOGGER.error("%s", ex)
         except OSError as ex:
-            _LOGGER.error(
-                "Unable to connect to %s:%d (%s)", url, WEBBOX_PORT, ex
-            )
+            _LOGGER.error("Unable to connect to %s:%d (%s)", url, WEBBOX_PORT, ex)
 
-    # -------------------------------------------------------------------------
-    # Parse command line
     parser = argparse.ArgumentParser(description="SMA webbox example.")
     parser.add_argument("url", type=str, help="SMA webbox url")
     parser.add_argument("-d", help="Debug loglevel", action="store_true")
-
     args = parser.parse_args()
-
-    # Setup logger
     logging.basicConfig(
         stream=sys.stdout, level=logging.DEBUG if args.d else logging.INFO
     )
-
-    # Run main loop
     asyncio.run(main(url=args.url))
